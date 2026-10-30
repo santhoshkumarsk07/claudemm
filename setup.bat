@@ -11,7 +11,7 @@ where python >nul 2>nul || set PY=py -3
 )
 %PY% -m venv .venv
 .venv\Scripts\python -m pip install --upgrade pip -q
-.venv\Scripts\python -m pip install -r requirements.txt -q
+.venv\Scripts\python -m pip install --require-hashes -r requirements.lock -q
 if not exist .env copy .env.example .env >nul
 echo.
 echo Setup done. Double-click START-TRADING.bat to open the Arena.

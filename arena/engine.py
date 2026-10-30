@@ -121,6 +121,9 @@ class PaperBroker:
             (self.run_id, ts, decision_id, symbol, side, qty, quote, fill, round(slip, 2),
              chg.total if chg else 0, json.dumps(chg.as_dict()) if chg else None, trigger, status, note),
         )
+        self.j.audit("order", {"symbol": symbol, "side": side, "qty": qty, "quote": quote, "fill": fill,
+                               "charges": chg.total if chg else 0, "trigger": trigger, "status": status,
+                               "note": note[:120], "decision_id": decision_id}, self.run_id, ts)
         return slip
 
     def buy(self, ts: datetime, q: Quote, alloc_pct: float, stop_pct: float, target_pct: float,

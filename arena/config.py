@@ -4,6 +4,8 @@ import os
 import tomllib
 from pathlib import Path
 
+from .secure import owner_only
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -23,6 +25,7 @@ def set_env_value(key: str, value: str, path: Path = ROOT / ".env") -> None:
     lines = path.read_text().splitlines() if path.exists() else []
     lines = [l for l in lines if not l.startswith(key + "=")] + [f"{key}={value}"]
     path.write_text("\n".join(lines) + "\n")
+    owner_only(path)
     os.environ[key] = value
 
 

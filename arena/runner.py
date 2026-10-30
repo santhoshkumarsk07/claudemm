@@ -173,6 +173,7 @@ class Runner:
             out = normalize(brain.decide(ctx), allowed)
         except Exception as e:
             log.warning("%s failed (%s); using rules fallback for this cycle.", brain.name, e)
+            self.j.audit("brain_fallback", {"brain": brain.name, "error": str(e)[:200]}, self.run_id, now.isoformat())
             brain = self.fallback
             out = normalize(brain.decide(ctx), allowed)
         view = out["market_view"]
@@ -217,6 +218,9 @@ class Runner:
     def run(self) -> None:
         poll = self.st["poll_seconds"]
         target_days = self.cfg["account"]["challenge_days"]
+        self.j.audit("session_start", {"feed": self.feed.name, "brain": self.brain.name, "days_done": self.days_done(),
+                                       "product": self.st["product"], "profile": self.st.get("profile")},
+                     self.run_id, self.feed.now().isoformat())
         while True:
             if self.stop_requested:
                 self.broker.snapshot(self.feed.now())
@@ -225,6 +229,7 @@ class Runner:
                     log.warning("%d intraday position(s) left open. They are squared off at 15:15 if you resume today, "
                                 "or at the start of the next session.", len(self.broker.positions))
                 log.info("Paused. Cash, positions and history are saved. Press Start to resume.")
+                self.j.audit("session_paused", {"open_positions": len(self.broker.positions)}, self.run_id, self.feed.now().isoformat())
                 return
             if self.feed.finished():
                 break
@@ -251,6 +256,8 @@ class Runner:
         if self.day:
             self.close_day(self.feed.now())
         self.j.x("UPDATE runs SET status='complete', ended_at=? WHERE id=?", (self.feed.now().isoformat(), self.run_id))
+        self.j.audit("run_complete", {"days": self.days_done(), "equity": round(self.broker.equity, 2)},
+                     self.run_id, self.feed.now().isoformat())
         self.write_report()
         log.info("Run %d finished. Report: %s", self.run_id, self.report_path)
 
@@ -270,6 +277,8 @@ class Runner:
         if not self.killed and b.equity <= self.day_start_equity * (1 - max_loss / 100):
             self.killed = True
             self._save_day_state()
+            self.j.audit("kill_switch", {"equity": round(b.equity, 2), "day_start_equity": round(self.day_start_equity, 2),
+                                         "limit_pct": max_loss}, self.run_id, now.isoformat())
             log.warning("Daily loss limit (%.1f%%) hit. Closing positions, no new entries today.", max_loss)
             for m in b.square_off_all(now, quotes, "kill_switch"):
                 log.info(m)

@@ -115,6 +115,20 @@ We do not support Zerodha Kite for this, because Kite's terms restrict virtual/m
 | `python -m arena compete --brains rules,claude-api --days 10` | Several strategies, same prices, same capital, leaderboard. |
 | `python -m arena report [--ai]` | Rebuilds the results page. `--ai` adds Claude's coach review. |
 | `python -m arena status` | Lists all runs with equity and P&L. |
+| `python -m arena audit [--last 20]` | Verifies the tamper-evident audit trail (orders, settings changes, kill switch, sessions) and prints its head hash. |
+| `python -m arena gui --no-open --autostart` | Server mode: resumes live trading on launch and restarts it after errors. See [deploy/README.md](deploy/README.md). |
+
+## Run it 24×7 on a server
+
+[deploy/README.md](deploy/README.md) sets the Arena up on a small always-on Ubuntu server in India (AWS Lightsail Mumbai recommended, Oracle Cloud Always Free for zero cost). One script handles the firewall, key-only SSH, automatic security updates, IST time sync, a sandboxed systemd service and nightly encrypted backups. The control panel stays private behind an SSH tunnel.
+
+## Security
+
+- **Control panel:** listens on 127.0.0.1 only. Every action needs a secret token generated at launch, and requests from other websites or other host names are refused, so a web page you visit cannot drive the Arena.
+- **Secrets:** API keys and tokens live only in `.env`, which is kept readable by your account only. They are redacted from logs, the panel's activity view and the audit trail.
+- **Untrusted AI output:** every reply from Claude is validated before use. Unknown symbols, invalid actions and out-of-range numbers are dropped, and stop-loss/target are clamped to `stop_loss_bounds` / `target_bounds`.
+- **Audit trail:** every order, settings change, kill-switch event, brain fallback and session start/stop is appended to a hash-chained log. `python -m arena audit` detects any edit or deletion.
+- **Dependencies:** installed from `requirements.lock` with pinned versions and hashes. CI runs the tests on Windows and Linux and a weekly vulnerability scan (`pip-audit`).
 
 ## The 15-day Breaking Money challenge
 
@@ -139,6 +153,7 @@ With the defaults (10 stocks, a decision every 15 minutes, `claude-opus-5-5` at 
 ```
 arena/
   safety.py      real-money block (allow-list, SDK import block, paper_only lock)
+  secure.py      secret redaction for logs and audit trail, owner-only file permissions
   engine.py      virtual account, fills, stops, square-off
   charges.py     Indian charges (edit rates in config.toml)
   brain.py       Claude API / Claude CLI / rules baseline
@@ -149,6 +164,8 @@ arena/
 config.toml      all settings
 data/arena.db    SQLite journal (runs, decisions, orders, trades, equity, days)
 tests/           python -m unittest discover tests
+deploy/          server setup script, systemd service, nightly backup
+requirements.lock  pinned, hash-checked dependencies (requirements.txt lists the direct ones)
 ```
 
 ## Limits of V1

@@ -14,18 +14,20 @@ from .clock import IST, now_ist
 from .config import ROOT, load_config, load_env, set_env_value
 from .db import Journal
 from .safety import RealMoneyBlocked, install_guards
+from .secure import RedactingFormatter, owner_only
 
 log = logging.getLogger("arena")
 
 
 def setup_logging(cfg: dict) -> None:
     Path(cfg["paths"]["log"]).parent.mkdir(parents=True, exist_ok=True)
-    fmt = logging.Formatter("%(asctime)s  %(message)s", "%H:%M:%S")
+    fmt = RedactingFormatter("%(asctime)s  %(message)s", "%H:%M:%S")
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     for h in (logging.StreamHandler(sys.stdout), logging.FileHandler(cfg["paths"]["log"], encoding="utf-8")):
         h.setFormatter(fmt)
         root.addHandler(h)
+    owner_only(cfg["paths"]["log"])
     for noisy in ("httpx", "yfinance", "urllib3", "anthropic", "peewee"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
     logging.getLogger("yfinance").setLevel(logging.CRITICAL)  # its errors are reported by our own retry/warn messages
@@ -241,7 +243,21 @@ def cmd_check(a, cfg):
 
 def cmd_gui(a, cfg):
     from .gui import serve
-    serve(a.port, not a.no_open)
+    serve(a.port, not a.no_open, a.autostart)
+
+
+def cmd_audit(a, cfg):
+    db = cfg["paths"]["db"] if not a.demo else str(Path(cfg["paths"]["data_dir"]) / "demo.db")
+    j = Journal(db)
+    for r in reversed(j.q("SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (a.last,))):
+        print(f"  #{r['id']:<5} {r['ts']}  run={r['run_id']}  {r['kind']:16s} {r['data'][:110]}")
+    ok, n, info = j.verify_audit()
+    if ok:
+        print(f"\nAudit chain OK: {n} events. Head hash {info}")
+        print("Note the head hash somewhere outside this machine; it proves later that no event was removed.")
+    else:
+        print(f"\nAUDIT CHAIN BROKEN after {n} good events: {info}")
+        sys.exit(1)
 
 
 def main(argv=None):
@@ -279,13 +295,19 @@ def main(argv=None):
     sub.add_parser("check", help="test safety guard, market data and Claude setup")
     g = sub.add_parser("gui", help="open the control panel in your browser")
     g.add_argument("--port", type=int, default=8787); g.add_argument("--no-open", action="store_true")
+    g.add_argument("--autostart", action="store_true", help="resume live paper trading on launch and restart it after errors (server use)")
+    au = sub.add_parser("audit", help="verify the tamper-evident audit trail and show recent events")
+    au.add_argument("--last", type=int, default=20); au.add_argument("--demo", action="store_true")
 
     a = p.parse_args(argv)
     cfg = load_config(a.config)
     install_guards(cfg)
     setup_logging(cfg)
+    if owner_only(ROOT / ".env"):
+        log.warning("Your .env was readable by other users; restricted it to your account only.")
     {"run": cmd_run, "replay": cmd_replay, "demo": cmd_demo, "fetch": cmd_fetch, "report": cmd_report,
-     "status": cmd_status, "compete": cmd_compete, "upstox-login": cmd_upstox_login, "check": cmd_check, "gui": cmd_gui}[a.cmd](a, cfg)
+     "status": cmd_status, "compete": cmd_compete, "upstox-login": cmd_upstox_login, "check": cmd_check, "gui": cmd_gui,
+     "audit": cmd_audit}[a.cmd](a, cfg)
 
 
 if __name__ == "__main__":

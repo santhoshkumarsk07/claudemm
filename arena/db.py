@@ -1,10 +1,14 @@
 """SQLite journal: every decision, order, fill, trade, equity snapshot and day."""
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
+
+from .clock import now_ist
+from .secure import owner_only, redact
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -46,9 +50,22 @@ CREATE TABLE IF NOT EXISTS notes (
 CREATE TABLE IF NOT EXISTS day_state (
   run_id INTEGER, date TEXT, start_equity REAL, killed INTEGER DEFAULT 0, PRIMARY KEY (run_id, date)
 );
+CREATE TABLE IF NOT EXISTS audit_log (
+  id INTEGER PRIMARY KEY, ts TEXT, run_id INTEGER, kind TEXT, data TEXT, prev_hash TEXT, hash TEXT
+);
 CREATE INDEX IF NOT EXISTS ix_equity_run ON equity(run_id, ts);
 CREATE INDEX IF NOT EXISTS ix_dec_run ON decisions(run_id, ts);
 """
+
+# Schema changes after this release, oldest first. Each entry is a tuple of SQL statements and
+# runs once per database (tracked in PRAGMA user_version). Never edit or reorder a shipped entry.
+MIGRATIONS: list[tuple[str, ...]] = []
+
+GENESIS = "0" * 64
+
+
+def _chain_hash(prev: str, ts: str, run_id, kind: str, data: str) -> str:
+    return hashlib.sha256(f"{prev}|{ts}|{run_id}|{kind}|{data}".encode("utf-8")).hexdigest()
 
 
 class Journal:
@@ -58,6 +75,16 @@ class Journal:
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
         self._tx_depth = 0
+        owner_only(path)  # trading history and the audit trail are private
+        self._migrate()
+
+    def _migrate(self) -> None:
+        version = self.conn.execute("PRAGMA user_version").fetchone()[0]
+        for n, statements in enumerate(MIGRATIONS[version:], start=version + 1):
+            with self.tx():
+                for sql in statements:
+                    self.x(sql)
+                self.x(f"PRAGMA user_version = {n}")
 
     def x(self, sql: str, params=()) -> sqlite3.Cursor:
         cur = self.conn.execute(sql, params)
@@ -70,6 +97,8 @@ class Journal:
         """Writes inside commit together or not at all. Nested blocks join the outer one."""
         self._tx_depth += 1
         try:
+            if self._tx_depth == 1 and not self.conn.in_transaction:
+                self.conn.execute("BEGIN IMMEDIATE")  # take the write lock now: reads inside see a stable state
             yield
         except BaseException:
             if self._tx_depth == 1:
@@ -104,3 +133,28 @@ class Journal:
 
     def latest_run(self) -> dict | None:
         return self.one("SELECT * FROM runs ORDER BY id DESC LIMIT 1")
+
+    # ---- audit trail -------------------------------------------------
+    def audit(self, kind: str, data: dict, run_id: int | None = None, ts: str | None = None) -> str:
+        """Append a tamper-evident event: each row's hash covers the previous row's hash,
+        so editing or deleting any earlier row breaks every hash after it."""
+        ts = ts or now_ist().isoformat(timespec="seconds")
+        body = redact(json.dumps(data, sort_keys=True, default=str, ensure_ascii=False))
+        with self.tx():
+            last = self.one("SELECT hash FROM audit_log ORDER BY id DESC LIMIT 1")
+            prev = last["hash"] if last else GENESIS
+            h = _chain_hash(prev, ts, run_id, kind, body)
+            self.x("INSERT INTO audit_log(ts, run_id, kind, data, prev_hash, hash) VALUES (?,?,?,?,?,?)",
+                   (ts, run_id, kind, body, prev, h))
+        return h
+
+    def verify_audit(self) -> tuple[bool, int, str]:
+        """Walk the chain. Returns (ok, rows checked, head hash or the first problem found)."""
+        prev, n = GENESIS, 0
+        for r in self.conn.execute("SELECT * FROM audit_log ORDER BY id"):
+            if r["prev_hash"] != prev:
+                return False, n, f"row {r['id']}: chain broken (a row before it was edited or deleted)"
+            if _chain_hash(prev, r["ts"], r["run_id"], r["kind"], r["data"]) != r["hash"]:
+                return False, n, f"row {r['id']}: contents were modified"
+            prev, n = r["hash"], n + 1
+        return True, n, prev

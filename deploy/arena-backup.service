@@ -1,0 +1,13 @@
+[Unit]
+Description=AI Trading Arena journal backup
+
+[Service]
+Type=oneshot
+User=arena
+Group=arena
+WorkingDirectory=/opt/arena
+# Optional settings (encryption passphrase file, rclone remote): see deploy/README.md
+EnvironmentFile=-/opt/arena/data/backup.env
+ExecStart=/opt/arena/deploy/backup.sh
+UMask=0077
+NoNewPrivileges=true

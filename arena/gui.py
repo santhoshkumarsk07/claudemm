@@ -20,6 +20,7 @@ from pathlib import Path
 from .clock import is_market_open, next_open, now_ist
 from .config import ROOT, load_config
 from .db import Journal
+from .secure import RedactingFormatter
 
 log = logging.getLogger("arena")
 LOG_LINES: collections.deque[str] = collections.deque(maxlen=300)
@@ -36,8 +37,11 @@ class Controller:
         self.thread: threading.Thread | None = None
         self.runner = None
         self.mode = "idle"
+        self.last_mode = ""
         self.error = ""
         self.lock = threading.Lock()
+        self.watchdog = False      # server mode: restart live trading if it stops with an error
+        self.keep_running = False  # False after the user presses Stop
 
     def cfg(self) -> dict:
         from .__main__ import _brain_cfg
@@ -51,7 +55,7 @@ class Controller:
         with self.lock:
             if self.busy:
                 return f"Already running ({self.mode}). Stop it first."
-            self.mode, self.error = mode, ""
+            self.mode, self.last_mode, self.error = mode, mode, ""
 
             def wrap():
                 try:
@@ -87,6 +91,7 @@ class Controller:
             self.runner = Runner(cfg, feed, j, rid)
             self.runner.write_report()
             self.runner.run()
+        self.keep_running = True
         return self._spawn("live", go)
 
     def start_demo(self, days: int = 3) -> str:
@@ -127,6 +132,7 @@ class Controller:
         return self._spawn("review", go)
 
     def stop(self) -> str:
+        self.keep_running = False
         if self.runner:
             self.runner.stop_requested = True
             log.info("Stopping after the current step...")
@@ -191,10 +197,16 @@ class Controller:
             ("strategy", "max_daily_loss_pct"): float(s["max_daily_loss_pct"]),
             ("strategy", "notes"): str(s.get("notes", "")).replace("\n", " "),
         }
+        before = load_config(self.config_path)
         for (section, key), val in updates.items():
             text = set_toml(text, section, key, val)
         self.config_path.write_text(text, encoding="utf-8")
-        load_config(self.config_path)  # validate
+        after = load_config(self.config_path)  # validate
+        changed = {f"{s}.{k}": [before[s].get(k), after[s].get(k)] for s, k in updates if before[s].get(k) != after[s].get(k)}
+        if changed:
+            j = Journal(after["paths"]["db"])
+            j.audit("settings_changed", changed)
+            j.close()
         log.info("Settings saved.")
         return "ok"
 
@@ -294,9 +306,19 @@ def make_handler(ctl: Controller, token: str):
     return H
 
 
-def serve(port: int = 8787, open_browser: bool = True) -> None:
+def _watch(ctl: Controller) -> None:
+    """Server mode: if live trading stopped with an error (not by Stop, not because the run
+    finished), start it again. The runner resumes the same run from the journal."""
+    while True:
+        threading.Event().wait(60)
+        if ctl.watchdog and ctl.keep_running and not ctl.busy and ctl.last_mode == "live" and ctl.error:
+            log.warning("Trading stopped with an error (%s). Restarting it...", ctl.error)
+            ctl.start_live(False, "")
+
+
+def serve(port: int = 8787, open_browser: bool = True, autostart: bool = False) -> None:
     h = _Buffer()
-    h.setFormatter(logging.Formatter("%(asctime)s  %(message)s", "%H:%M:%S"))
+    h.setFormatter(RedactingFormatter("%(asctime)s  %(message)s", "%H:%M:%S"))
     logging.getLogger().addHandler(h)
     ctl = Controller()
     token = secrets.token_urlsafe(32)
@@ -312,6 +334,11 @@ def serve(port: int = 8787, open_browser: bool = True) -> None:
     print(f"\n  AI Trading Arena is running at {url}\n  Keep this window open. Close it to quit.\n")
     if open_browser:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+    if autostart:
+        ctl.watchdog = True
+        log.info("Autostart: resuming live paper trading.")
+        ctl.start_live(False, "")
+        threading.Thread(target=_watch, args=(ctl,), daemon=True).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

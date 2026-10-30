@@ -1,0 +1,34 @@
+[Unit]
+Description=AI Trading Arena (control panel + live session)
+After=network-online.target time-sync.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=arena
+Group=arena
+WorkingDirectory=/opt/arena
+# The panel listens on 127.0.0.1 only. Reach it through an SSH tunnel (see deploy/README.md).
+ExecStart=/opt/arena/.venv/bin/python -m arena gui --no-open --autostart
+Restart=always
+RestartSec=30
+Environment=PYTHONUNBUFFERED=1
+Environment=XDG_CACHE_HOME=/opt/arena/data/cache
+
+# Sandbox: the service can write only its journal, reports, settings and .env (token refresh).
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/arena/data /opt/arena/reports /opt/arena/config.toml /opt/arena/.env
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

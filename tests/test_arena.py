@@ -465,5 +465,109 @@ class Panel(unittest.TestCase):
         self.assertIn(b'const TOKEN="s3cret"', page)
 
 
+
+class Secrets(unittest.TestCase):
+    def test_logs_are_redacted(self):
+        import io
+        import logging
+        import os
+        from arena.secure import RedactingFormatter
+        os.environ["UPSTOX_ACCESS_TOKEN"] = "eyJ0eXAiOiJKV1QiLCJhbGciOi.secret"
+        try:
+            buf = io.StringIO()
+            h = logging.StreamHandler(buf)
+            h.setFormatter(RedactingFormatter("%(message)s"))
+            lg = logging.getLogger("redact-test")
+            lg.addHandler(h)
+            lg.propagate = False
+            lg.warning("token %s", os.environ["UPSTOX_ACCESS_TOKEN"])
+            lg.warning("headers {'Authorization': 'Bearer abcdefghijklmnop'} key sk-ant-api03-ZZZZZZZZZZZZ")
+            lg.warning("POST /token code=4f9a2b7c client_secret=hunter22hunter grant_type=authorization_code")
+            try:
+                raise RuntimeError("failed with access_token=SHOULDNOTLEAK123")
+            except RuntimeError:
+                lg.exception("boom")
+            out = buf.getvalue()
+        finally:
+            del os.environ["UPSTOX_ACCESS_TOKEN"]
+        for leaked in ("eyJ0eXAiOiJKV1Qi", "abcdefghijklmnop", "sk-ant-api03", "4f9a2b7c", "hunter22", "SHOULDNOTLEAK"):
+            self.assertNotIn(leaked, out)
+        self.assertIn("max_tokens=16000", __import__("arena.secure", fromlist=["redact"]).redact("max_tokens=16000"))
+
+    @unittest.skipUnless(sys.platform != "win32", "POSIX permissions")
+    def test_env_and_journal_are_owner_only(self):
+        import os
+        import stat
+        from arena.config import set_env_value
+        tmp = Path(tempfile.mkdtemp())
+        env = tmp / ".env"
+        env.write_text("A=1\n")
+        os.chmod(env, 0o644)
+        set_env_value("UPSTOX_ACCESS_TOKEN", "x" * 20, env)
+        os.environ.pop("UPSTOX_ACCESS_TOKEN", None)
+        self.assertEqual(stat.S_IMODE(env.stat().st_mode), 0o600)
+        Journal(tmp / "j.db")
+        self.assertEqual(stat.S_IMODE((tmp / "j.db").stat().st_mode), 0o600)
+
+
+class Audit(unittest.TestCase):
+    def setUp(self):
+        self.cfg = cfg_tmp(tempfile.mkdtemp())
+        self.j = Journal(self.cfg["paths"]["db"])
+        self.rid = self.j.new_run("a", "test", "x", "rules", "", 100000, self.cfg, "2026-10-05T09:15")
+
+    def test_orders_are_audited_and_chain_verifies(self):
+        b = PaperBroker(self.j, self.rid, self.cfg)
+        t = datetime(2026, 10, 5, 10, 0, tzinfo=IST)
+        b.buy(t, q(ltp=1000), 20, 1.5, 3, "in")
+        b.sell(t, q(ltp=1010), "ai", "out")
+        b.buy(t, q(ltp=1000), 0, 1.5, 3, "zero allocation")  # rejected orders are audited too
+        kinds = [r["kind"] for r in self.j.q("SELECT kind FROM audit_log ORDER BY id")]
+        self.assertEqual(kinds, ["order", "order", "order"])
+        ok, n, head = self.j.verify_audit()
+        self.assertTrue(ok)
+        self.assertEqual((n, len(head)), (3, 64))
+
+    def test_tampering_is_detected(self):
+        for i in range(3):
+            self.j.audit("note", {"i": i}, self.rid)
+        self.j.x("UPDATE audit_log SET data=? WHERE id=2", ('{"i": 99}',))
+        ok, n, why = self.j.verify_audit()
+        self.assertFalse(ok)
+        self.assertIn("row 2", why)
+        self.j.x("DELETE FROM audit_log WHERE id=2")  # removing the row breaks the link instead
+        self.assertIn("chain broken", self.j.verify_audit()[2])
+
+    def test_secrets_never_enter_the_audit_trail(self):
+        self.j.audit("note", {"msg": "Bearer abcdefghijklmnop"}, self.rid)
+        self.assertNotIn("abcdefghijklmnop", self.j.one("SELECT data FROM audit_log")["data"])
+        self.assertTrue(self.j.verify_audit()[0])
+
+    def test_run_lifecycle_is_audited(self):
+        feed = SimFeed(["RELIANCE"], n_days=1)
+        self.cfg["market"]["watchlist"] = ["RELIANCE"]
+        self.cfg["account"]["challenge_days"] = 1
+        Runner(self.cfg, feed, self.j, self.rid).run()
+        kinds = {r["kind"] for r in self.j.q("SELECT kind FROM audit_log")}
+        self.assertTrue({"session_start", "run_complete"} <= kinds)
+        self.assertTrue(self.j.verify_audit()[0])
+
+
+class Migrations(unittest.TestCase):
+    def test_each_migration_runs_once(self):
+        from arena import db
+        path = Path(tempfile.mkdtemp()) / "m.db"
+        Journal(path).close()  # an existing database from before the migration
+        saved = list(db.MIGRATIONS)
+        db.MIGRATIONS.append(("ALTER TABLE trades ADD COLUMN setup TEXT",))
+        try:
+            j = Journal(path)
+            j2 = Journal(path)  # reopening must not apply it again (would fail: duplicate column)
+            self.assertEqual(j2.conn.execute("PRAGMA user_version").fetchone()[0], len(db.MIGRATIONS))
+            self.assertIn("setup", [c["name"] for c in j.q("PRAGMA table_info(trades)")])
+        finally:
+            db.MIGRATIONS[:] = saved
+
+
 if __name__ == "__main__":
     unittest.main()
