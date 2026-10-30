@@ -17,7 +17,7 @@ from arena.clock import IST  # noqa: E402
 from arena.config import load_config  # noqa: E402
 from arena.db import Journal  # noqa: E402
 from arena.engine import PaperBroker  # noqa: E402
-from arena.feeds.base import Quote  # noqa: E402
+from arena.feeds.base import PriceFeed, Quote  # noqa: E402
 from arena.feeds.sim import SimFeed  # noqa: E402
 from arena.runner import Runner  # noqa: E402
 
@@ -133,6 +133,21 @@ class Engine(unittest.TestCase):
         self.assertTrue(msgs and "stop_loss" in msgs[0])
         self.assertEqual(self.b.positions, {})
 
+    def test_bad_stop_and_target_are_clamped(self):
+        self.b.buy(self.t, q(ltp=1000), 20, -1.0, 500, "bad levels")
+        p = self.b.positions["TEST"]
+        self.assertLess(p.stop, p.avg_price)                       # a negative stop is not placed above entry
+        self.assertAlmostEqual(p.target, round(p.avg_price * 1.10, 2))  # capped at target_bounds[1] = 10%
+        self.assertEqual(self.b.check_exits(self.t, {"TEST": q(ltp=1000)}), [])
+
+    def test_failed_write_rolls_back(self):
+        self.b.buy(self.t, q(ltp=1000), 20, 1.5, 3, "in")
+        with self.assertRaises(RuntimeError):
+            with self.j.tx():
+                self.j.x("DELETE FROM positions WHERE run_id=?", (self.rid,))
+                raise RuntimeError("crash mid-write")
+        self.assertEqual(len(self.j.q("SELECT * FROM positions WHERE run_id=?", (self.rid,))), 1)
+
     def test_state_survives_restart(self):
         self.b.buy(self.t, q(ltp=1000), 20, 1.5, 3, "in")
         b2 = PaperBroker(self.j, self.rid, self.cfg)
@@ -206,10 +221,6 @@ class EndToEnd(unittest.TestCase):
         brains = {x["brain"] for x in j.q("SELECT DISTINCT brain FROM decisions WHERE run_id=?", (rid,))}
         self.assertEqual(brains, {"claude-api", "rules"})  # outage cycle fell back to rules
         self.assertGreater(j.one("SELECT COUNT(*) n FROM orders WHERE run_id=? AND status='filled'", (rid,))["n"], 0)
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class Adapters(unittest.TestCase):
@@ -298,3 +309,161 @@ class Profiles(unittest.TestCase):
         Runner(cfg, feed, j, rid, brain=Timid()).run()
         self.assertEqual(j.q("SELECT COUNT(*) n FROM orders WHERE side='BUY' AND status='filled'")[0]["n"], 0)
         self.assertGreater(j.q("SELECT COUNT(*) n FROM decisions WHERE outcome LIKE 'rejected: confidence%'")[0]["n"], 0)
+
+
+class BrainOutput(unittest.TestCase):
+    def test_normalize_cleans_and_drops(self):
+        from arena.brain import normalize
+        out = normalize({"market_view": 5, "decisions": [
+            {"symbol": "tcs", "action": "buy", "confidence": None, "allocation_pct": float("nan"), "stop_loss_pct": "1.2"},
+            {"symbol": "NOTINLIST", "action": "BUY"},
+            {"symbol": "INFY", "action": "<img src=x onerror=alert(1)>"},
+            "junk",
+        ]}, {"TCS", "INFY"})
+        self.assertEqual(len(out["decisions"]), 1)
+        d = out["decisions"][0]
+        self.assertEqual((d["symbol"], d["action"], d["confidence"], d["allocation_pct"], d["stop_loss_pct"]),
+                         ("TCS", "BUY", 0.0, 0.0, 1.2))
+        self.assertEqual(out["market_view"], "5")
+
+    def test_unusable_reply_raises(self):
+        from arena.brain import normalize
+        for bad in (None, [], {"decisions": "x"}, {"decisions": [{"symbol": "TCS"}]}):
+            with self.assertRaises(ValueError):
+                normalize(bad, {"TCS"})
+
+    def test_malformed_replies_do_not_crash_the_run(self):
+        class Sloppy:
+            name = "claude-cli"
+
+            def __init__(self):
+                self.calls = 0
+
+            def decide(self, ctx):
+                self.calls += 1
+                sym = next(iter(ctx["market"]))
+                return [
+                    {"market_view": "x", "decisions": [{"symbol": sym, "confidence": 0.9}]},  # no action
+                    {"market_view": "x", "decisions": [{"symbol": sym, "action": "BUY", "confidence": None}]},
+                    {"decisions": "not a list"},
+                ][self.calls % 3]
+
+        tmp = tempfile.mkdtemp()
+        cfg = cfg_tmp(tmp)
+        cfg["account"]["challenge_days"] = 1
+        cfg["market"]["watchlist"] = cfg["market"]["watchlist"][:2]
+        feed = SimFeed(cfg["market"]["watchlist"], n_days=1)
+        j = Journal(cfg["paths"]["db"])
+        rid = j.new_run("s", "demo", "sim", "rules", "", 100000, cfg, feed.now().isoformat())
+        Runner(cfg, feed, j, rid, brain=Sloppy()).run()
+        self.assertEqual(j.one("SELECT status FROM runs WHERE id=?", (rid,))["status"], "complete")
+        brains = {r["brain"] for r in j.q("SELECT DISTINCT brain FROM decisions WHERE run_id=?", (rid,))}
+        self.assertEqual(brains, {"claude-cli", "rules"})  # usable replies kept, unusable ones fell back
+
+
+class Report(unittest.TestCase):
+    def test_calls_are_escaped(self):
+        from arena import report
+        cfg = cfg_tmp(tempfile.mkdtemp())
+        j = Journal(cfg["paths"]["db"])
+        rid = j.new_run("r", "demo", "sim", "rules", "", 100000, cfg, "2026-10-05T09:15:00+05:30")
+        j.x("INSERT INTO decisions(run_id, ts, symbol, action, confidence, reason) VALUES (?,?,?,?,?,?)",
+            (rid, "2026-10-05T10:00:00+05:30", "TCS", "<img src=x onerror=alert(1)>", 0.5, "<script>x</script>"))
+        page = report.write(j, rid, cfg["paths"]["report"]).read_text(encoding="utf-8")
+        self.assertNotIn("<img src=x", page)
+        self.assertNotIn("<script>x</script>", page)
+
+
+class DayLifecycle(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.cfg = cfg_tmp(self.tmp)
+        self.cfg["market"]["watchlist"] = ["RELIANCE"]
+        self.j = Journal(self.cfg["paths"]["db"])
+        self.rid = self.j.new_run("d", "demo", "sim", "rules", "", 100000, self.cfg, "2026-10-05T09:15:00+05:30")
+
+    def runner(self, feed=None):
+        return Runner(self.cfg, feed or SimFeed(["RELIANCE"], n_days=2), self.j, self.rid, report_path=f"{self.tmp}/r.html")
+
+    def test_restart_keeps_day_baseline_and_kill_switch(self):
+        t = datetime(2026, 10, 5, 11, 0, tzinfo=IST)
+        r1 = self.runner()
+        r1.open_day(t, {})
+        r1.killed = True
+        r1._save_day_state()
+        self.j.x("UPDATE account SET cash=95000 WHERE run_id=?", (self.rid,))
+        r2 = self.runner()
+        r2.open_day(t.replace(hour=13), {})
+        self.assertEqual(r2.day_start_equity, 100000)
+        self.assertTrue(r2.killed)
+
+    def test_intraday_position_is_not_carried_overnight(self):
+        r1 = self.runner()
+        r1.broker.buy(datetime(2026, 10, 5, 14, 0, tzinfo=IST), q("RELIANCE", 1450), 20, 1.5, 3, "in")
+        r2 = self.runner()
+        r2.open_day(datetime(2026, 10, 6, 9, 20, tzinfo=IST), {"RELIANCE": q("RELIANCE", 1440)})
+        self.assertEqual(r2.broker.positions, {})
+        self.assertEqual(self.j.one("SELECT exit_reason FROM trades WHERE run_id=?", (self.rid,))["exit_reason"], "stale_square_off")
+
+    def test_stale_prices_do_not_open_a_day(self):
+        class Frozen(PriceFeed):  # e.g. an NSE holiday: the feed keeps serving the last session's prices
+            live = False
+
+            def now(self):
+                return datetime(2026, 10, 6, 11, 0, tzinfo=IST)
+
+            def quotes(self, symbols):
+                return {s: q(s, 1450) for s in symbols}  # stamped 2026-10-05 10:00
+
+            def candles(self, *a, **k):
+                raise AssertionError("no analysis on stale prices")
+
+        feed = Frozen()
+        r = self.runner(feed)
+        r.tick(feed.now())
+        self.assertIsNone(r.day)
+        self.assertEqual(self.j.one("SELECT COUNT(*) n FROM decisions WHERE run_id=?", (self.rid,))["n"], 0)
+
+
+class Panel(unittest.TestCase):
+    def setUp(self):
+        import threading
+        from http.server import ThreadingHTTPServer
+        from arena.gui import Controller, make_handler
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(Controller(), "s3cret"))
+        self.port = self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+
+    def request(self, method, path, headers, body=None):
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request(method, path, body=body, headers=headers)
+        r = c.getresponse()
+        out = r.status, r.read()
+        c.close()
+        return out
+
+    def test_actions_need_token_and_local_origin(self):
+        ok = {"Content-Type": "application/json", "X-Arena-Token": "s3cret"}
+        post = lambda h: self.request("POST", "/api/stop", h, "{}")
+        self.assertEqual(post({"Content-Type": "text/plain"})[0], 403)        # cross-site "simple" request
+        self.assertEqual(post({**ok, "X-Arena-Token": "wrong"})[0], 403)
+        self.assertEqual(post({**ok, "Origin": "https://evil.example"})[0], 403)
+        self.assertEqual(post({**ok, "Host": "evil.example"})[0], 403)       # DNS rebinding
+        status, body = post({**ok, "Origin": f"http://127.0.0.1:{self.port}"})
+        self.assertEqual(status, 200)
+        self.assertIn(b"Nothing is running", body)
+
+    def test_reads_need_local_host_and_panel_embeds_token(self):
+        self.assertEqual(self.request("GET", "/api/state", {"Host": "evil.example"})[0], 403)
+        status, page = self.request("GET", "/", {})
+        self.assertEqual(status, 200)
+        self.assertIn(b'const TOKEN="s3cret"', page)
+
+
+if __name__ == "__main__":
+    unittest.main()

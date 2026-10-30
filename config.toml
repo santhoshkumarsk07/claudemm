@@ -33,6 +33,9 @@ max_positions = 5
 max_position_pct = 20          # max % of equity in one stock
 default_stop_loss_pct = 1.5
 default_target_pct = 3.0
+stop_loss_bounds = [0.3, 5.0]  # any stop-loss % from the brain is clamped into this range
+target_bounds = [0.3, 10.0]    # same for the target %
+max_quote_age_minutes = 15     # ignore older prices (market holiday, frozen feed)
 max_daily_loss_pct = 3.0       # kill switch: close everything and stop entries for the day
 # Free-text guidance passed to Claude. Use it to try different styles across the series.
 notes = ""

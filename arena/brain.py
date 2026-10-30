@@ -10,6 +10,7 @@ done by the engine.
 from __future__ import annotations
 
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -72,6 +73,47 @@ def build_prompt(ctx: dict, cfg: dict) -> tuple[str, str]:
     )
     user = "Current state (JSON):\n" + json.dumps(ctx, indent=1, default=str) + "\n\nReturn your decisions."
     return system, user
+
+
+ACTIONS = {"BUY", "SELL", "HOLD"}
+
+
+def _num(v, lo: float, hi: float) -> float:
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return 0.0
+    return min(max(x, lo), hi) if math.isfinite(x) else 0.0
+
+
+def normalize(out, symbols) -> dict:
+    """Coerce a brain reply into clean decisions, dropping items that cannot be used.
+
+    The API reply is schema-constrained but the CLI reply is not, so nothing downstream
+    trusts the raw output. Raises ValueError when the reply as a whole is unusable.
+    """
+    if not isinstance(out, dict) or not isinstance(out.get("decisions"), list):
+        raise ValueError("reply has no decisions list")
+    symbols = set(symbols)
+    decs = []
+    for d in out["decisions"]:
+        if not isinstance(d, dict):
+            continue
+        sym = str(d.get("symbol", "")).strip().upper()
+        act = str(d.get("action", "")).strip().upper()
+        if sym not in symbols or act not in ACTIONS:
+            continue
+        decs.append({
+            "symbol": sym, "action": act,
+            "allocation_pct": _num(d.get("allocation_pct"), 0, 100),
+            "confidence": _num(d.get("confidence"), 0, 1),
+            "stop_loss_pct": _num(d.get("stop_loss_pct"), -100, 100),  # the engine clamps to sane bounds
+            "target_pct": _num(d.get("target_pct"), -100, 1000),
+            "reason": str(d.get("reason") or "")[:500],
+        })
+    if out["decisions"] and not decs:
+        raise ValueError("no usable decisions in reply")
+    return {"market_view": str(out.get("market_view") or "")[:1000], "decisions": decs}
 
 
 def _extract_json(text: str) -> dict:

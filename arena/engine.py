@@ -45,6 +45,11 @@ def round_tick(p: float, up: bool) -> float:
     return round((math.ceil(n - 1e-9) if up else math.floor(n + 1e-9)) * TICK, 2)
 
 
+def _clamp(x: float, bounds) -> float:
+    lo, hi = bounds
+    return min(max(x, lo), hi)
+
+
 class PaperBroker:
     def __init__(self, journal: Journal, run_id: int, cfg: dict):
         assert PAPER_ONLY, "paper-only constant was tampered with"
@@ -81,15 +86,16 @@ class PaperBroker:
         self._save_positions()
 
     def _save_positions(self) -> None:
-        self.j.x("DELETE FROM positions WHERE run_id=?", (self.run_id,))
-        for p in self.positions.values():
-            self.j.conn.execute(
-                "INSERT INTO positions VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (self.run_id, p.symbol, p.qty, p.avg_price, p.stop, p.target, p.opened_at,
-                 p.entry_charges, p.entry_reason, p.last_price),
-            )
-        self.j.x("UPDATE account SET cash=?, realized=?, charges=?, slippage=? WHERE run_id=?",
-                 (self.cash, self.realized, self.total_charges, self.total_slippage, self.run_id))
+        with self.j.tx():
+            self.j.x("DELETE FROM positions WHERE run_id=?", (self.run_id,))
+            for p in self.positions.values():
+                self.j.x(
+                    "INSERT INTO positions VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (self.run_id, p.symbol, p.qty, p.avg_price, p.stop, p.target, p.opened_at,
+                     p.entry_charges, p.entry_reason, p.last_price),
+                )
+            self.j.x("UPDATE account SET cash=?, realized=?, charges=?, slippage=? WHERE run_id=?",
+                     (self.cash, self.realized, self.total_charges, self.total_slippage, self.run_id))
 
     # ---- fills -------------------------------------------------------
     def fill_price(self, side: str, q: Quote, qty: int) -> float:
@@ -125,6 +131,9 @@ class PaperBroker:
         if len(self.positions) >= self.st["max_positions"]:
             return self._reject(ts, decision_id, s, "BUY", q, "max open positions reached")
         alloc_pct = min(max(alloc_pct, 0), self.st["max_position_pct"])
+        # A negative stop would sit above the entry (instant loss); a huge one is no stop at all.
+        stop_pct = _clamp(stop_pct, self.st.get("stop_loss_bounds", (0.3, 5.0)))
+        target_pct = _clamp(target_pct, self.st.get("target_bounds", (0.3, 10.0)))
         budget = min(self.equity * alloc_pct / 100, self.cash * 0.995)
         est = self.fill_price("BUY", q, 1)
         qty = min(int(budget // est), self.max_qty_by_liquidity(q))
@@ -137,15 +146,16 @@ class PaperBroker:
             chg = charges_mod.compute("BUY", qty, fill, self.product, self.rates)
         if qty < 1:
             return self._reject(ts, decision_id, s, "BUY", q, "not enough cash after charges")
-        self.cash -= qty * fill + chg.total
-        self.total_charges += chg.total
-        self.total_slippage += self._order(ts.isoformat(), decision_id, s, "BUY", qty, q.ltp, fill, chg, "ai", "filled", reason[:200])
-        self.positions[s] = Position(
-            symbol=s, qty=qty, avg_price=fill, stop=round(fill * (1 - stop_pct / 100), 2),
-            target=round(fill * (1 + target_pct / 100), 2), opened_at=ts.isoformat(),
-            entry_charges=chg.total, entry_reason=reason[:300], last_price=q.ltp,
-        )
-        self._save_positions()
+        with self.j.tx():  # order, position and cash land together or not at all
+            self.cash -= qty * fill + chg.total
+            self.total_charges += chg.total
+            self.total_slippage += self._order(ts.isoformat(), decision_id, s, "BUY", qty, q.ltp, fill, chg, "ai", "filled", reason[:200])
+            self.positions[s] = Position(
+                symbol=s, qty=qty, avg_price=fill, stop=round(fill * (1 - stop_pct / 100), 2),
+                target=round(fill * (1 + target_pct / 100), 2), opened_at=ts.isoformat(),
+                entry_charges=chg.total, entry_reason=reason[:300], last_price=q.ltp,
+            )
+            self._save_positions()
         return True, f"BUY {qty} {s} @ {fill:.2f} (quote {q.ltp:.2f}, charges {chg.total:.2f})"
 
     def sell(self, ts: datetime, q: Quote, trigger: str, reason: str = "", decision_id: int | None = None) -> tuple[bool, str]:
@@ -156,21 +166,22 @@ class PaperBroker:
         qty = p.qty
         fill = self.fill_price("SELL", q, qty)
         chg = charges_mod.compute("SELL", qty, fill, self.product, self.rates)
-        self.cash += qty * fill - chg.total
-        self.total_charges += chg.total
-        self.total_slippage += self._order(ts.isoformat(), decision_id, s, "SELL", qty, q.ltp, fill, chg, trigger, "filled", reason[:200])
         gross = (fill - p.avg_price) * qty
         net = gross - p.entry_charges - chg.total
-        self.realized += net
         hold = (ts - datetime.fromisoformat(p.opened_at)).total_seconds() / 60
-        self.j.x(
-            "INSERT INTO trades(run_id, symbol, qty, entry_ts, entry_price, exit_ts, exit_price, gross_pnl, charges, net_pnl, exit_reason, hold_minutes, entry_reason) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (self.run_id, s, qty, p.opened_at, p.avg_price, ts.isoformat(), fill, round(gross, 2),
-             round(p.entry_charges + chg.total, 2), round(net, 2), trigger, round(hold, 1), p.entry_reason),
-        )
-        del self.positions[s]
-        self._save_positions()
+        with self.j.tx():  # a crash can no longer record the trade but keep the position (double count)
+            self.cash += qty * fill - chg.total
+            self.total_charges += chg.total
+            self.total_slippage += self._order(ts.isoformat(), decision_id, s, "SELL", qty, q.ltp, fill, chg, trigger, "filled", reason[:200])
+            self.realized += net
+            self.j.x(
+                "INSERT INTO trades(run_id, symbol, qty, entry_ts, entry_price, exit_ts, exit_price, gross_pnl, charges, net_pnl, exit_reason, hold_minutes, entry_reason) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (self.run_id, s, qty, p.opened_at, p.avg_price, ts.isoformat(), fill, round(gross, 2),
+                 round(p.entry_charges + chg.total, 2), round(net, 2), trigger, round(hold, 1), p.entry_reason),
+            )
+            del self.positions[s]
+            self._save_positions()
         return True, f"SELL {qty} {s} @ {fill:.2f} ({trigger}) net {net:+.2f}"
 
     def _reject(self, ts, decision_id, symbol, side, q, why):

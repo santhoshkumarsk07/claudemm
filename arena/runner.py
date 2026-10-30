@@ -7,7 +7,7 @@ import time as _time
 from datetime import datetime, timedelta
 
 from . import insights, report
-from .brain import RulesBrain, make_brain
+from .brain import RulesBrain, make_brain, normalize
 from .clock import CLOSE, is_market_open, next_open, parse_hhmm
 from .db import Journal
 from .engine import PaperBroker
@@ -36,6 +36,7 @@ class Runner:
         self.last_snapshot = None
         self.last_report = 0.0
         self.stop_requested = False  # set by the GUI's Stop button
+        self._stale_logged = None
 
     def _sleep(self, seconds: float) -> None:
         """Live: sleep in 1 s slices so Stop takes effect quickly. Replay: advance the clock."""
@@ -50,17 +51,33 @@ class Runner:
     def days_done(self) -> int:
         return self.j.one("SELECT COUNT(*) n FROM days WHERE run_id=?", (self.run_id,))["n"]
 
-    def open_day(self, now: datetime) -> None:
+    def open_day(self, now: datetime, quotes) -> None:
         self.day = now.date()
-        self.day_start_equity = self.broker.equity
-        self.killed = False
+        d = self.day.isoformat()
+        if self.st["product"] == "intraday":  # left open by a Stop before square-off: never carry them overnight
+            for s in [s for s, p in self.broker.positions.items() if p.opened_at[:10] < d]:
+                if s in quotes:
+                    log.warning(self.broker.sell(now, quotes[s], "stale_square_off", "intraday position from an earlier session")[1])
+        # Resuming the same day keeps the morning's baseline, so a restart cannot reset the daily loss limit.
+        saved = self.j.one("SELECT start_equity, killed FROM day_state WHERE run_id=? AND date=?", (self.run_id, d))
+        if saved:
+            self.day_start_equity, self.killed = saved["start_equity"], bool(saved["killed"])
+            log.info("=== Day %d  %s resumed: day started at Rs %.2f%s ===", self.days_done() + 1, self.day,
+                     self.day_start_equity, ", daily loss limit already hit" if self.killed else "")
+        else:
+            self.day_start_equity, self.killed = self.broker.equity, False
+            self._save_day_state()
+            log.info("=== Day %d  %s  equity Rs %.2f ===", self.days_done() + 1, self.day, self.day_start_equity)
         self.next_decision = now
-        log.info("=== Day %d  %s  equity Rs %.2f ===", self.days_done() + 1, self.day, self.day_start_equity)
+
+    def _save_day_state(self) -> None:
+        self.j.x("INSERT OR REPLACE INTO day_state VALUES (?,?,?,?)",
+                 (self.run_id, self.day.isoformat(), self.day_start_equity, int(self.killed)))
 
     def close_day(self, now: datetime) -> None:
         d = self.day.isoformat()
         if self.st["product"] == "intraday" and self.broker.positions:
-            q = self._quotes(list(self.broker.positions))
+            q = self._quotes(list(self.broker.positions), fresh_only=False)
             for m in self.broker.square_off_all(now, q, "square_off"):
                 log.info(m)
         self.broker.snapshot(now)
@@ -80,15 +97,29 @@ class Runner:
         self.write_report()
 
     # ---- helpers -----------------------------------------------------
-    def _quotes(self, symbols: list[str]):
+    def _quotes(self, symbols: list[str], fresh_only: bool = True):
         for attempt in range(5):
             try:
-                return self.feed.quotes(symbols)
+                quotes = self.feed.quotes(symbols)
+                break
             except Exception as e:  # keep the session alive through feed hiccups
                 log.warning("Quote fetch failed (%s). Retrying...", e)
                 if self.feed.live:
-                    _time.sleep(min(2 ** attempt, 30))
-        return {}
+                    self._sleep(min(2 ** attempt, 30))
+                if self.stop_requested:
+                    return {}
+        else:
+            return {}
+        if not fresh_only:
+            return quotes
+        # Old prices mean a market holiday or a frozen feed: never decide or fill on them.
+        oldest = self.feed.now() - timedelta(minutes=self.st.get("max_quote_age_minutes", 15))
+        fresh = {s: q for s, q in quotes.items() if q.ts >= oldest}
+        if quotes and not fresh and self._stale_logged != self.feed.now().date():
+            self._stale_logged = self.feed.now().date()
+            log.warning("Prices are stale (latest %s). Market holiday or feed delay? Not trading on them.",
+                        max(q.ts for q in quotes.values()).strftime("%d %b %H:%M"))
+        return fresh
 
     def write_report(self) -> None:
         try:
@@ -136,14 +167,15 @@ class Runner:
 
     def decide_and_execute(self, now: datetime, quotes) -> None:
         ctx = self.build_context(now, quotes)
+        allowed = set(ctx["market"]) | set(self.broker.positions)
         brain = self.brain
         try:
-            out = brain.decide(ctx)
+            out = normalize(brain.decide(ctx), allowed)
         except Exception as e:
             log.warning("%s failed (%s); using rules fallback for this cycle.", brain.name, e)
             brain = self.fallback
-            out = brain.decide(ctx)
-        view = out.get("market_view", "")
+            out = normalize(brain.decide(ctx), allowed)
+        view = out["market_view"]
         # Orders reach the market after the decision: re-quote before filling.
         if not self.feed.live:
             self.feed.sleep(self.cfg["execution"]["replay_latency_seconds"])
@@ -151,14 +183,14 @@ class Runner:
         fresh = self._quotes(self.universe + list(self.broker.positions)) or quotes
         self.broker.mark(fresh)
         # Sells first to free cash, then buys by confidence.
-        decs = sorted(out.get("decisions", []), key=lambda d: (d["action"] != "SELL", -float(d.get("confidence", 0))))
+        decs = sorted(out["decisions"], key=lambda d: (d["action"] != "SELL", -d["confidence"]))
         for d in decs:
-            sym, act = d.get("symbol"), d.get("action", "HOLD")
+            sym, act = d["symbol"], d["action"]
             cur = self.j.x(
                 "INSERT INTO decisions(run_id, ts, symbol, action, allocation_pct, confidence, stop_loss_pct, target_pct, reason, market_view, brain) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (self.run_id, now.isoformat(), sym, act, d.get("allocation_pct", 0), d.get("confidence", 0),
-                 d.get("stop_loss_pct", 0), d.get("target_pct", 0), d.get("reason", ""), view, brain.name))
+                (self.run_id, now.isoformat(), sym, act, d["allocation_pct"], d["confidence"],
+                 d["stop_loss_pct"], d["target_pct"], d["reason"], view, brain.name))
             did, msg = cur.lastrowid, "hold"
             q = fresh.get(sym)
             if act == "BUY":
@@ -166,15 +198,15 @@ class Runner:
                     msg = "rejected: no quote"
                 elif not ctx["entries_allowed"]:
                     msg = "rejected: entries closed"
-                elif float(d.get("confidence", 0)) < self.st.get("min_confidence", 0):
+                elif d["confidence"] < self.st.get("min_confidence", 0):
                     msg = f"rejected: confidence below {self.st['min_confidence']}"
                 else:
-                    sl = d.get("stop_loss_pct") or self.st["default_stop_loss_pct"]
-                    tg = d.get("target_pct") or self.st["default_target_pct"]
-                    _, msg = self.broker.buy(exec_time, q, float(d.get("allocation_pct", 0)), float(sl), float(tg), d.get("reason", ""), did)
+                    sl = d["stop_loss_pct"] if d["stop_loss_pct"] > 0 else self.st["default_stop_loss_pct"]
+                    tg = d["target_pct"] if d["target_pct"] > 0 else self.st["default_target_pct"]
+                    _, msg = self.broker.buy(exec_time, q, d["allocation_pct"], sl, tg, d["reason"], did)
             elif act == "SELL":
                 if q and sym in self.broker.positions:
-                    _, msg = self.broker.sell(exec_time, q, "ai", d.get("reason", ""), did)
+                    _, msg = self.broker.sell(exec_time, q, "ai", d["reason"], did)
                 else:
                     msg = "ignored: not held"
             self.j.x("UPDATE decisions SET outcome=? WHERE id=?", (msg, did))
@@ -189,6 +221,9 @@ class Runner:
             if self.stop_requested:
                 self.broker.snapshot(self.feed.now())
                 self.write_report()
+                if self.st["product"] == "intraday" and self.broker.positions:
+                    log.warning("%d intraday position(s) left open. They are squared off at 15:15 if you resume today, "
+                                "or at the start of the next session.", len(self.broker.positions))
                 log.info("Paused. Cash, positions and history are saved. Press Start to resume.")
                 return
             if self.feed.finished():
@@ -209,10 +244,8 @@ class Runner:
                 else:
                     self._sleep(poll)
                 continue
-            if self.day is None:
-                if self.days_done() >= target_days:
-                    break
-                self.open_day(now)
+            if self.day is None and self.days_done() >= target_days:
+                break
             self.tick(now)
             self._sleep(poll)
         if self.day:
@@ -226,6 +259,8 @@ class Runner:
         quotes = self._quotes(symbols)
         if not quotes:
             return
+        if self.day is None:  # a day starts with its first fresh prices, so a holiday never counts as one
+            self.open_day(now, quotes)
         b = self.broker
         b.mark(quotes)
         for m in b.check_exits(now, quotes):
@@ -234,6 +269,7 @@ class Runner:
         max_loss = self.st["max_daily_loss_pct"]
         if not self.killed and b.equity <= self.day_start_equity * (1 - max_loss / 100):
             self.killed = True
+            self._save_day_state()
             log.warning("Daily loss limit (%.1f%%) hit. Closing positions, no new entries today.", max_loss)
             for m in b.square_off_all(now, quotes, "kill_switch"):
                 log.info(m)

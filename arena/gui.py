@@ -7,9 +7,11 @@ internet and, as everywhere in this app, no real orders exist.
 from __future__ import annotations
 
 import collections
+import hmac
 import json
 import logging
 import re
+import secrets
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -220,10 +222,26 @@ def set_toml(text: str, section: str, key: str, value) -> str:
     raise KeyError(f"[{section}] not found in config.toml")
 
 
-def make_handler(ctl: Controller):
+def make_handler(ctl: Controller, token: str):
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
+
+        def _trusted(self, action: bool) -> bool:
+            """Only this panel may drive the arena. The Host check blocks DNS rebinding, the Origin
+            check blocks other sites, and actions also need the per-launch token and a JSON body
+            (which forces a CORS preflight that this server never approves)."""
+            port = self.server.server_address[1]
+            local = {f"127.0.0.1:{port}", f"localhost:{port}"}
+            if self.headers.get("Host") not in local:
+                return False
+            origin = self.headers.get("Origin")
+            if origin is not None and origin.removeprefix("http://") not in local:
+                return False
+            if not action:
+                return True
+            ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip()
+            return ctype == "application/json" and hmac.compare_digest(self.headers.get("X-Arena-Token") or "", token)
 
         def _send(self, code, body, ctype="application/json"):
             data = body if isinstance(body, bytes) else body.encode("utf-8")
@@ -234,9 +252,11 @@ def make_handler(ctl: Controller):
             self.wfile.write(data)
 
         def do_GET(self):
+            if not self._trusted(action=False):
+                return self._send(403, "{}")
             path = self.path.split("?")[0]
             if path == "/":
-                return self._send(200, PANEL, "text/html")
+                return self._send(200, PANEL.replace("{{TOKEN}}", token), "text/html")
             if path == "/api/state":
                 return self._send(200, json.dumps(ctl.state()))
             if path in ("/report", "/demo"):
@@ -249,10 +269,12 @@ def make_handler(ctl: Controller):
             self._send(404, "{}")
 
         def do_POST(self):
-            n = int(self.headers.get("Content-Length") or 0)
-            body = json.loads(self.rfile.read(n) or b"{}")
+            if not self._trusted(action=True):
+                return self._send(403, json.dumps({"msg": "Forbidden"}))
             path = self.path
             try:
+                n = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(n) or b"{}")
                 if path == "/api/start":
                     msg = ctl.start_live(bool(body.get("new")), body.get("name", ""))
                 elif path == "/api/stop":
@@ -277,9 +299,10 @@ def serve(port: int = 8787, open_browser: bool = True) -> None:
     h.setFormatter(logging.Formatter("%(asctime)s  %(message)s", "%H:%M:%S"))
     logging.getLogger().addHandler(h)
     ctl = Controller()
+    token = secrets.token_urlsafe(32)
     for p in range(port, port + 10):
         try:
-            srv = ThreadingHTTPServer(("127.0.0.1", p), make_handler(ctl))
+            srv = ThreadingHTTPServer(("127.0.0.1", p), make_handler(ctl, token))
             break
         except OSError:
             continue
@@ -379,9 +402,10 @@ iframe{flex:1;border:0;width:100%;background:var(--page)}
 </main>
 <script>
 let tab="report",loaded=false;
+const TOKEN="{{TOKEN}}";
 const $=id=>document.getElementById(id);
 const rs=v=>(v<0?"−":"")+"₹"+Math.abs(v).toLocaleString("en-IN",{minimumFractionDigits:2,maximumFractionDigits:2});
-async function post(url,body){const r=await fetch(url,{method:"POST",body:JSON.stringify(body||{})});const j=await r.json();$("msg").textContent=j.msg==="ok"?"":j.msg;refresh()}
+async function post(url,body){const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json","X-Arena-Token":TOKEN},body:JSON.stringify(body||{})});const j=await r.json();$("msg").textContent=j.msg==="ok"?"":j.msg;refresh()}
 function start(n){post("/api/start",{new:n})}
 function startNew(){const name=prompt("Name for the new challenge","Breaking Money Challenge");if(name!==null)post("/api/start",{new:true,name})}
 function showTab(t){tab=t;$("t_report").classList.toggle("on",t==="report");$("t_demo").classList.toggle("on",t==="demo");reloadFrame()}

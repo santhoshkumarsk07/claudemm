@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 
 SCHEMA = """
@@ -42,6 +43,9 @@ CREATE TABLE IF NOT EXISTS days (
 CREATE TABLE IF NOT EXISTS notes (
   run_id INTEGER, ts TEXT, kind TEXT, text TEXT
 );
+CREATE TABLE IF NOT EXISTS day_state (
+  run_id INTEGER, date TEXT, start_equity REAL, killed INTEGER DEFAULT 0, PRIMARY KEY (run_id, date)
+);
 CREATE INDEX IF NOT EXISTS ix_equity_run ON equity(run_id, ts);
 CREATE INDEX IF NOT EXISTS ix_dec_run ON decisions(run_id, ts);
 """
@@ -53,11 +57,32 @@ class Journal:
         self.conn = sqlite3.connect(str(path))
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        self._tx_depth = 0
 
     def x(self, sql: str, params=()) -> sqlite3.Cursor:
         cur = self.conn.execute(sql, params)
-        self.conn.commit()
+        if not self._tx_depth:
+            self.conn.commit()
         return cur
+
+    @contextmanager
+    def tx(self):
+        """Writes inside commit together or not at all. Nested blocks join the outer one."""
+        self._tx_depth += 1
+        try:
+            yield
+        except BaseException:
+            if self._tx_depth == 1:
+                self.conn.rollback()
+            raise
+        else:
+            if self._tx_depth == 1:
+                self.conn.commit()
+        finally:
+            self._tx_depth -= 1
+
+    def close(self) -> None:
+        self.conn.close()
 
     def q(self, sql: str, params=()) -> list[dict]:
         return [dict(r) for r in self.conn.execute(sql, params).fetchall()]

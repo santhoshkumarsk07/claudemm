@@ -98,7 +98,7 @@ def write(j: Journal, run_id: int, path: str | Path, live: bool = False) -> Path
                 f'<td class="n {_cls(t["net_pnl"])}">{_rs(t["net_pnl"], True)}</td><td>{_e(t["exit_reason"].replace("_", " "))}</td></tr>')
 
     def call_row(c):
-        return (f'<tr><td class="n">{_e(c["ts"][5:16].replace("T", " "))}</td><td><span class="act {c["action"].lower()}">{c["action"]}</span></td>'
+        return (f'<tr><td class="n">{_e(c["ts"][5:16].replace("T", " "))}</td><td><span class="act {_e(c["action"].lower())}">{_e(c["action"])}</span></td>'
                 f'<td>{_e(c["symbol"])}</td><td class="n">{(c["confidence"] or 0):.2f}</td><td class="r">{_e(c["reason"])}</td>'
                 f'<td class="r muted">{_e(c["outcome"])}</td></tr>')
 

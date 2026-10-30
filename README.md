@@ -65,6 +65,7 @@ Want to try your own strategy idea? Write it in plain English in **Settings → 
 - **Mac says the file can't be opened:** run `chmod +x setup.sh start-trading.command` in Terminal, or right-click the file and choose **Open**.
 - **No prices / "no quotes returned":** the market is closed or Yahoo is briefly unavailable. Try again during market hours, or run the offline `demo`.
 - **Nothing happens after Start:** the agent waits for 09:15 IST. Outside market hours it sleeps until the next open.
+- **"Prices are stale" in the log:** the feed returned old prices (an NSE holiday, or the feed is lagging). The agent waits instead of trading on them. Raise `max_quote_age_minutes` if your feed is slow.
 
 ---
 
