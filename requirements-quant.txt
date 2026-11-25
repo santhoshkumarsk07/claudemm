@@ -1,0 +1,11 @@
+# Free AI + Algorithmic Trading Agent (python -m quant). All free and open source.
+pandas>=2.0
+numpy>=1.24
+requests>=2.31
+yfinance>=0.2.50
+scikit-learn>=1.4
+xgboost>=2.0
+langgraph>=0.2
+streamlit>=1.40
+plotly>=5.20
+tzdata>=2024.1

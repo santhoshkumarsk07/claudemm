@@ -8,6 +8,8 @@ The Arena is a local AI paper-trading agent for Indian stocks (NSE). It watches 
 
 **What you need:** a Windows or Mac computer, [Python 3.11 or newer](https://www.python.org/downloads/), and about 5 minutes. No broker account and no paid data. Prices come free from Yahoo Finance.
 
+> **New: `quant/`, a free AI + algorithmic research and paper-trading system.** Nine agents (LangGraph), technical indicators, walk-forward ML (scikit-learn, XGBoost), an optional local LLM via Ollama, cost-aware backtests and a Streamlit dashboard, using only free data and software. See [docs/QUANT_GUIDE.md](docs/QUANT_GUIDE.md). Quick start: `pip install -r requirements-quant.txt`, `python -m quant check`, `python -m quant fetch`, `python -m quant dashboard`.
+
 ---
 
 ## Quick start

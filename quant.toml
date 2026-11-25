@@ -1,0 +1,48 @@
+# Free AI + Algorithmic Trading Agent: configuration (paper trading only)
+# Every value here has a default in quant/config.py; delete a line to use the default.
+
+[data]
+# Analysed (not traded): NIFTY 50 and BANK NIFTY indices.
+indices = ["^NSEI", "^NSEBANK"]
+# Traded in backtests and paper trading. NIFTYBEES/BANKBEES are ETFs you can actually buy,
+# so they stand in for the indices (an index itself cannot be bought in the cash market).
+watchlist = ["NIFTYBEES.NS", "BANKBEES.NS", "RELIANCE.NS", "HDFCBANK.NS", "ICICIBANK.NS", "INFY.NS", "TCS.NS", "SBIN.NS"]
+start = "2012-01-01"        # first date to download (daily bars)
+db = "data/quant.db"        # SQLite store for bars, models, backtests and paper trading
+stale_after_hours = 30      # warn when the newest daily bar is older than this (outside holidays)
+
+[costs]
+product = "delivery"        # daily swing trades are delivery trades in India
+slippage_bps = 5            # adverse slippage per fill, in basis points (0.05%)
+
+[risk]
+risk_per_trade_pct = 1.0    # lose at most this % of equity if the stop is hit
+max_position_pct = 25.0     # never put more than this % of equity in one stock
+stop_atr_mult = 2.0         # stop-loss distance = 2 x ATR(14)
+take_profit_rr = 2.0        # take-profit = 2 x the stop distance (reward/risk 2:1)
+min_reward_risk = 1.5       # reject trades whose reward/risk is below this
+max_daily_loss_pct = 2.0    # a day that loses more than this blocks new entries next day
+max_drawdown_pct = 15.0     # drawdown beyond this pauses new entries...
+drawdown_pause_bars = 20    # ...for this many sessions, then restarts from the new equity level
+cooldown_bars = 3           # bars to wait after a losing trade before re-entering that stock
+max_open_positions = 5
+
+[ml]
+horizon = 5                 # predict the return over the next 5 trading days
+min_train_bars = 750        # ~3 years before the first walk-forward prediction
+test_bars = 63              # retrain every quarter (~63 trading days)
+model = "gradient_boosting" # logistic | random_forest | gradient_boosting | xgboost
+buy_threshold = 0.55        # ML strategy: go long when P(up) >= this
+hybrid_threshold = 0.50     # hybrid strategy: algorithmic entry needs P(up) >= this
+
+[paper]
+capital = 1000000           # virtual rupees
+db = "data/paper.db"
+
+[llm]
+# Optional local LLM through Ollama (free, runs on your machine). The LLM can only comment
+# or veto a new entry. It never creates orders, sizes positions or changes risk limits.
+enabled = true
+host = "http://localhost:11434"
+model = "llama3.1:8b"
+timeout_seconds = 60
