@@ -2,8 +2,8 @@
 .env
 .env.*
 !.env.example
-data/
-reports/
+/data/
+/reports/
 *.db
 *.log
 
