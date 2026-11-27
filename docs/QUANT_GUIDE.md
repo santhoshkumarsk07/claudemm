@@ -83,8 +83,11 @@ claudemm/
 │   ├── llm.py                 optional Ollama advisor (agree / caution / veto)
 │   ├── agents.py              the nine agents + LangGraph orchestration
 │   ├── paper.py               persistent paper account (SQLite)
+│   ├── live.py                live market-hours session (1-minute bars, stops every minute)
 │   └── dashboard.py           Streamlit dashboard
-├── tests/test_quant.py        19 offline tests (indicators, causality, fills, risk, ML leakage, agents)
+├── AUTOPILOT.bat              runs one full paper-trading day (Windows)
+├── SCHEDULE-AUTOPILOT.bat     creates the weekday Task Scheduler job (Windows)
+├── tests/test_quant.py        offline tests (indicators, causality, fills, risk, ML leakage, agents)
 ├── data/                      created at runtime (git-ignored): quant.db, paper.db, paper_replay.db
 └── docs/QUANT_GUIDE.md        this file
 ```
@@ -248,6 +251,35 @@ python -m quant paper replay --start 2026-06-01   # forward-test on sessions the
 Orders queued tonight fill at the next session's open when you run it the next evening; skipped days are caught up with the same deterministic rules. The account (cash, positions, pending orders, risk state, trade history, equity) lives in `data/paper.db` and survives restarts.
 
 `paper replay` retrains models on data **before** the start date only, then runs the full LangGraph agent cycle once per past session, each time seeing only data up to that evening. It writes to `data/paper_replay.db`, labelled as a historical simulation.
+
+### Phase 10b: Live session and daily automation
+
+The trading day has two halves:
+
+| When | Command | What happens |
+|---|---|---|
+| 09:15–15:30 IST | `python -m quant live` | Orders queued last evening fill at the **first 1-minute bar's open** (plus slippage and charges). Every minute, new 1-minute bars are checked against each position's stop-loss and target. At 15:30 the account is marked to the last prices and the day is closed. |
+| After 15:30 IST | `python -m quant daily` | Waits for Yahoo to publish today's daily bar, **retrains** the model on all data up to today (walk-forward + final model), then runs the nine agents, which queue tomorrow's orders. |
+| Both | `python -m quant autopilot` | Runs `live`, waits until 15:45, then runs `daily`. Weekends do nothing; a holiday ends the live part at 10:00 when no bars arrive. |
+
+Why new decisions are only made after the close: the strategies and models were tested on daily bars. Deciding mid-session from a half-finished bar would trade a strategy that was never tested. During the session, only exits (stops and targets) react to live prices.
+
+Live prices come from Yahoo 1-minute bars: free, unofficial and **delayed**. The dashboard's Paper portfolio tab shows each live price with its bar time and a DELAYED label. If you start late, queued orders fill at the latest price instead of the open, and the log says so. The day's bar is never treated as final before 15:30 (an unfinished bar would be look-ahead).
+
+**Retraining every day** keeps the model current. It adds one new day of data, so it does not make the model accurate by itself: walk-forward AUC stays the honest measure of skill.
+
+**Windows: run it automatically every weekday**
+
+1. Double-click `SCHEDULE-AUTOPILOT.bat` once. It creates a Task Scheduler job, "Quant Paper Autopilot", that runs `AUTOPILOT.bat` at 09:00 Monday–Friday (your computer's clock must be on IST).
+2. Keep the computer on, awake and logged in from 09:00 to about 16:15 (Settings → System → Power → Sleep: Never while plugged in).
+3. Read `data\autopilot.log` or open the dashboard to see what happened.
+4. Remove the job any time: `schtasks /Delete /TN "Quant Paper Autopilot" /F`.
+
+**Mac / Linux:** add a cron line (`crontab -e`) on a machine set to IST:
+
+```
+0 9 * * 1-5 cd /path/to/claudemm && .venv/bin/python -m quant autopilot >> data/autopilot.log 2>&1
+```
 
 ### Phase 11: Dashboard and integration
 

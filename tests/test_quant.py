@@ -272,3 +272,62 @@ class AgentsAndPaper(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LiveSessionTests(unittest.TestCase):
+    """A whole simulated trading day with a fake clock and fake 1-minute quotes."""
+
+    def test_open_fill_stop_and_close(self):
+        from datetime import datetime, timedelta
+        from quant.clock import IST
+        from quant.live import LiveSession
+        with tempfile.TemporaryDirectory() as d:
+            cfg = tmp_cfg(d)
+            cfg["data"]["watchlist"] = ["AAA.NS"]
+            acct = PaperAccount(cfg)
+            acct.queue("AAA.NS", "BUY", "test", atr=2.0, signal_date="2026-11-26")
+            acct.last_date = "2026-11-26"
+            day = datetime(2026, 11, 27, tzinfo=IST)
+            idx = pd.date_range(day.replace(hour=9, minute=15), day.replace(hour=15, minute=29), freq="1min")
+            px = np.full(len(idx), 100.0)
+            px[120:] = 95.0                                   # 11:15 drop below the 96 stop
+            bars = pd.DataFrame({"open": px, "high": px + 0.1, "low": px - 0.1, "close": px, "adj_close": px, "volume": 1e4}, index=idx)
+            clock = {"t": day.replace(hour=9, minute=10)}
+
+            def sleep(sec):
+                clock["t"] += timedelta(seconds=sec)
+
+            quotes = lambda syms: {"AAA.NS": bars[bars.index <= clock["t"]]}
+            r = LiveSession(cfg, acct, quotes=quotes, clock=lambda: clock["t"], sleep=sleep, poll_seconds=60).run()
+            self.assertEqual(r["status"], "closed")
+            t = acct.trades()[0]
+            self.assertEqual(t["entry_date"], "2026-11-27")
+            self.assertEqual(t["entry_price"], 100.05)       # 09:15 open + 5 bps, rounded up to the tick
+            self.assertEqual(t["exit_reason"], "stop_loss")
+            self.assertEqual(acct.last_date, "2026-11-27")    # the evening run will not re-process today
+            self.assertIn("2026-11-27", [str(x.date()) for x in acct.equity_curve().index])
+            self.assertEqual(acct.live_status()["state"], "closed")
+            again = LiveSession(cfg, PaperAccount(cfg), quotes=quotes, clock=lambda: clock["t"].replace(hour=10), sleep=sleep).run()
+            self.assertEqual(again["status"], "already_processed")
+
+    def test_holiday_ends_session(self):
+        from datetime import datetime, timedelta
+        from quant.clock import IST
+        from quant.live import LiveSession
+        with tempfile.TemporaryDirectory() as d:
+            cfg = tmp_cfg(d)
+            clock = {"t": datetime(2026, 11, 27, 9, 20, tzinfo=IST)}
+            r = LiveSession(cfg, PaperAccount(cfg), quotes=lambda s: {}, clock=lambda: clock["t"],
+                            sleep=lambda sec: clock.__setitem__("t", clock["t"] + timedelta(seconds=sec))).run()
+            self.assertEqual(r["status"], "no_data")
+
+
+class UnfinishedBar(unittest.TestCase):
+    def test_todays_bar_ignored_until_close(self):
+        from datetime import datetime
+        from quant.clock import IST
+        df = synthetic.daily_bars(5, start="2026-11-23")             # Mon..Fri 27 Nov
+        during = datetime(2026, 11, 27, 13, 40, tzinfo=IST)
+        after = datetime(2026, 11, 27, 15, 35, tzinfo=IST)
+        self.assertEqual(str(quality.drop_unfinished_session(df, during).index[-1].date()), "2026-11-26")
+        self.assertEqual(str(quality.drop_unfinished_session(df, after).index[-1].date()), "2026-11-27")

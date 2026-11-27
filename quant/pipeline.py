@@ -25,6 +25,8 @@ def fetch(store: Store, cfg: dict, symbols: list[str] | None = None, interval: s
     for s in symbols or all_symbols(cfg):
         try:
             df = src.fetch(s, interval, cfg["data"]["start"] if interval == "1d" else None)
+            if interval == "1d":
+                df = quality.drop_unfinished_session(df)
             df, issues = quality.clean(df)
             n = store.upsert_bars(df, s, interval, src.name)
             store.log_fetch(s, interval, src.name, "ok", n, "; ".join(issues))
@@ -48,6 +50,7 @@ def prepared(store: Store, symbol: str, end: str | None = None) -> pd.DataFrame:
     if raw.empty:
         return raw
     attrs = dict(raw.attrs)
+    raw = quality.drop_unfinished_session(raw)
     df, _ = quality.clean(raw)
     d = indicators.add_all(quality.adjusted(df), daily=True)
     d.attrs.update(attrs)

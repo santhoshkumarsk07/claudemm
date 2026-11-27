@@ -10,6 +10,9 @@
   compare                    traditional vs ML vs hybrid on the same out-of-sample window
   paper run|status|reset     daily agent cycle on the live paper account
   paper replay --start DATE  forward-test the full agent loop on past sessions it has never seen
+  live                       market hours: fill queued orders at the open, check stops every minute
+  daily                      evening: fetch today's bar, retrain the model, agents queue tomorrow's orders
+  autopilot                  live session + evening routine in one go (run it from Task Scheduler / cron)
   dashboard                  Streamlit dashboard
 """
 from __future__ import annotations
@@ -204,6 +207,68 @@ def cmd_paper(a, cfg):
         print(f"Saved to {path}; the dashboard shows it under 'Paper replay'.")
 
 
+def cmd_live(a, cfg):
+    from .live import LiveSession
+    from .paper import PaperAccount
+    r = LiveSession(cfg, PaperAccount(cfg), poll_seconds=a.poll).run()
+    print(f"Live session result: {r}")
+
+
+def _evening(cfg, retrain: bool = True, use_llm: bool = True, wait_for_bar: bool = True) -> None:
+    """After the close: get today's daily bar, retrain, run the agents to queue tomorrow's orders."""
+    import time as _time
+    from . import agents
+    from .clock import CLOSE, now_ist
+    from .paper import PaperAccount
+    store = Store(cfg["data"]["db"])
+    for attempt in range(4):
+        pipeline.fetch(store, cfg)
+        now = now_ist()
+        want = now.date() if now.weekday() < 5 and now.time() >= CLOSE else None
+        have = store.bars(pipeline.MARKET).index[-1].date()
+        if not wait_for_bar or want is None or have >= want or attempt == 3:
+            if want and have < want:
+                log.warning("No daily bar for %s yet (market holiday, or Yahoo is late). Using data up to %s.", want, have)
+            break
+        log.info("Today's daily bar is not published yet; retrying in 10 minutes...")
+        _time.sleep(600)
+    if retrain:
+        log.info("Retraining %s on all data up to today (walk-forward + final model)...", cfg["ml"]["model"])
+        for r in pipeline.train(store, cfg):
+            if "error" in r:
+                log.warning("Training %s: %s", r["symbol"], r["error"])
+    acct = PaperAccount(cfg)
+    st = agents.run(store, cfg, acct, fetch=False, use_llm=use_llm)
+    print(f"Evening agent cycle complete (as of {st['as_of']})")
+    for e in st["log"]:
+        print(f"  [{e['agent']}] {e['summary']}")
+
+
+def cmd_daily(a, cfg):
+    _evening(cfg, retrain=not a.no_train, use_llm=not a.no_llm, wait_for_bar=not a.no_wait)
+
+
+def cmd_autopilot(a, cfg):
+    """One command for the whole trading day. Schedule it for ~09:00 IST on weekdays."""
+    import time as _time
+    from datetime import datetime, time
+    from .clock import CLOSE, IST, now_ist
+    from .live import LiveSession
+    from .paper import PaperAccount
+    now = now_ist()
+    print(f"Autopilot started {now:%a %d %b %Y %H:%M} IST (paper trading only)")
+    if now.weekday() >= 5:
+        print("Weekend: nothing to do.")
+        return
+    if now.time() < CLOSE:
+        LiveSession(cfg, PaperAccount(cfg), poll_seconds=a.poll).run()
+    ready = datetime.combine(now.date(), time(15, 45), IST)  # give Yahoo time to publish the daily bar
+    while now_ist() < ready:
+        _time.sleep(min(60, max(1, (ready - now_ist()).total_seconds())))
+    _evening(cfg, retrain=not a.no_train, use_llm=not a.no_llm)
+    print("Autopilot finished for today.")
+
+
 def cmd_dashboard(a, cfg):
     app = Path(__file__).with_name("dashboard.py")
     return subprocess.call([sys.executable, "-m", "streamlit", "run", str(app), "--server.port", str(a.port),
@@ -229,6 +294,11 @@ def main(argv=None):
     pp.add_argument("--no-fetch", action="store_true"); pp.add_argument("--no-llm", action="store_true")
     pp.add_argument("--backtest", action="store_true"); pp.add_argument("--capital", type=float)
     pp.add_argument("--start"); pp.add_argument("--end")
+    lv = sub.add_parser("live"); lv.add_argument("--poll", type=int, default=60, help="seconds between price checks")
+    dy = sub.add_parser("daily"); dy.add_argument("--no-train", action="store_true"); dy.add_argument("--no-llm", action="store_true")
+    dy.add_argument("--no-wait", action="store_true", help="do not wait for today's daily bar")
+    ap = sub.add_parser("autopilot"); ap.add_argument("--poll", type=int, default=60)
+    ap.add_argument("--no-train", action="store_true"); ap.add_argument("--no-llm", action="store_true")
     d = sub.add_parser("dashboard"); d.add_argument("--port", type=int, default=8501)
     a = p.parse_args(argv)
     cfg = config.load(a.config)
@@ -236,7 +306,8 @@ def main(argv=None):
     _setup_logging()
     fn = {"check": cmd_check, "fetch": cmd_fetch, "import-csv": cmd_import_csv, "quality": cmd_quality,
           "indicators": cmd_indicators, "backtest": cmd_backtest, "train": cmd_train, "compare": cmd_compare,
-          "paper": cmd_paper, "dashboard": cmd_dashboard}[a.cmd]
+          "paper": cmd_paper, "live": cmd_live, "daily": cmd_daily, "autopilot": cmd_autopilot,
+          "dashboard": cmd_dashboard}[a.cmd]
     sys.exit(fn(a, cfg) or 0)
 
 

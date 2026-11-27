@@ -65,32 +65,54 @@ class PortfolioSim:
 
     # ---- one trading day -----------------------------------------------
     def step(self, date: pd.Timestamp, bars: dict[str, pd.Series]) -> list[str]:
-        """Process one session: fill queued orders at the open, run stops/targets, mark to the close."""
-        ev, d = [], date.strftime("%Y-%m-%d")
+        """Process one session from daily bars: fill queued orders at the open, run stops/targets,
+        mark to the close. The live session does the same with 1-minute bars (see quant/live.py)."""
+        ev = []
         for sym in list(self.pending):
-            if sym not in bars:
-                continue  # no bar today for this symbol (holiday/suspension): order waits
-            o, bar = self.pending.pop(sym), bars[sym]
-            if o["side"] == "SELL" and sym in self.positions:
-                ev.append(self._exit(sym, date, float(bar["open"]), "signal", o["reason"]))
-            elif o["side"] == "BUY" and sym not in self.positions:
-                ev.append(self._entry(sym, date, float(bar["open"]), o))
-        for sym, p in list(self.positions.items()):
-            if sym not in bars:
-                continue
-            bar = bars[sym]
-            o, h, l = float(bar["open"]), float(bar["high"]), float(bar["low"])
-            if l <= p.stop:
-                ev.append(self._exit(sym, date, min(o, p.stop), "stop_loss", f"low {l:.2f} <= stop {p.stop:.2f}"))
-            elif h >= p.target:
-                ev.append(self._exit(sym, date, max(o, p.target), "take_profit", f"high {h:.2f} >= target {p.target:.2f}"))
-        for sym, bar in bars.items():
-            self.last_close[sym] = float(bar["close"])
+            if sym in bars:  # no bar today (holiday/suspension): the order waits
+                ev += [m for m in [self.fill_pending(sym, date, float(bars[sym]["open"]))] if m]
+        for sym in list(self.positions):
+            if sym in bars:
+                b = bars[sym]
+                ev += [m for m in [self.check_bar(sym, date, float(b["open"]), float(b["high"]), float(b["low"]))] if m]
+        self.events += [f"{date.strftime('%Y-%m-%d')} {e}" for e in ev]
+        return ev + self.close_session(date, {s: float(b["close"]) for s, b in bars.items()})
+
+    def fill_pending(self, sym: str, ts: pd.Timestamp, price: float) -> str | None:
+        """Fill a queued order at `price` (the session open, or the live price when it is placed)."""
+        o = self.pending.pop(sym, None)
+        if o is None:
+            return None
+        if o["side"] == "SELL" and sym in self.positions:
+            return self._exit(sym, ts, price, "signal", o["reason"])
+        if o["side"] == "BUY" and sym not in self.positions:
+            return self._entry(sym, ts, price, o)
+        return None
+
+    def check_bar(self, sym: str, ts: pd.Timestamp, o: float, h: float, l: float) -> str | None:
+        """Stop-loss / take-profit against one bar. Stop first if both are touched; gaps fill at the open."""
+        p = self.positions.get(sym)
+        if p is None:
+            return None
+        if l <= p.stop:
+            return self._exit(sym, ts, min(o, p.stop), "stop_loss", f"low {l:.2f} <= stop {p.stop:.2f}")
+        if h >= p.target:
+            return self._exit(sym, ts, max(o, p.target), "take_profit", f"high {h:.2f} >= target {p.target:.2f}")
+        return None
+
+    def mark(self, prices: dict[str, float]) -> None:
+        for sym, px in prices.items():
+            self.last_close[sym] = float(px)
             if sym in self.positions:
-                self.positions[sym].last_price = float(bar["close"])
+                self.positions[sym].last_price = float(px)
+
+    def close_session(self, date: pd.Timestamp, closes: dict[str, float]) -> list[str]:
+        """End of session: mark to the closing prices, record equity, run the end-of-day risk checks."""
+        self.mark(closes)
+        d = date.strftime("%Y-%m-%d")
         eq = self.total_equity
         self.equity[d] = eq
-        ev += self.risk.on_close(date, eq)
+        ev = self.risk.on_close(pd.Timestamp(d), eq)
         self.events += [f"{d} {e}" for e in ev]
         return ev
 

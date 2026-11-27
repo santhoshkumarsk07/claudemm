@@ -74,7 +74,8 @@ with st.sidebar:
             stt = agents.run(s, CFG, PaperAccount(CFG), fetch=False)
         st.success(f"Agent cycle done for {stt['as_of']}.")
     st.divider()
-    st.caption("Run from a terminal:\n\n`python -m quant fetch`\n\n`python -m quant train`\n\n`python -m quant compare`\n\n`python -m quant paper run`")
+    st.caption("Run from a terminal:\n\n`python -m quant autopilot` (whole day)\n\n`python -m quant live` (market hours)\n\n"
+               "`python -m quant daily` (after 15:30)\n\n`python -m quant compare`")
 
 tabs = st.tabs(["Market overview", "Charts & indicators", "Signals & AI", "Agent analysis", "Paper portfolio",
                 "Backtests", "Risk"])
@@ -218,6 +219,16 @@ with tabs[4]:
     if which.startswith("Paper replay"):
         st.info("Replay: the agents traded past sessions one day at a time, with models trained only on data before the replay "
                 "window. It is a historical simulation, not live trading.")
+    ls = acct.live_status() if acct is live else None
+    if ls:
+        label = {"running": "🟢 LIVE session running", "closed": "Session closed", "no_data": "No live data (holiday?)"}.get(ls["state"], ls["state"])
+        st.markdown(f"**{label}** · last update {ls['updated_at'][11:16]} IST on {ls['updated_at'][:10]} · {ls['source']}")
+        if ls.get("prices"):
+            st.dataframe(pd.DataFrame([{"symbol": k, "price (delayed)": v["price"], "1-min bar": v["bar_time"],
+                                        "held": "✅" if k in acct.sim.positions else ""} for k, v in ls["prices"].items()]),
+                         hide_index=True, width="stretch")
+        st.caption("Live prices are free Yahoo 1-minute bars: unofficial and delayed. Stops are checked every minute; "
+                   "new BUY/SELL decisions are made after the close.")
     sim, eq, tr = acct.sim, acct.equity_curve(), acct.trades()
     m = metrics.compute(eq, tr, sim.capital, sim.charges_paid, sim.slippage_paid) if len(eq) else {}
     c = st.columns(5)

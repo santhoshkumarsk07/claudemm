@@ -53,6 +53,16 @@ def _spike_and_revert(close, jump: float = 0.25, back: float = 0.07, max_len: in
     return out
 
 
+def drop_unfinished_session(df: pd.DataFrame, now: datetime | None = None) -> pd.DataFrame:
+    """Daily bars only: remove today's bar until 15:30 IST. During market hours Yahoo already
+    returns a bar for today that is still changing; treating it as final would be look-ahead."""
+    from ..clock import CLOSE
+    now = now or datetime.now(IST)
+    if len(df) and df.index[-1].date() >= now.date() and now.time() < CLOSE:
+        return df[df.index.date < now.date()]
+    return df
+
+
 def adjusted(df: pd.DataFrame) -> pd.DataFrame:
     """Back-adjust OHLC for splits and dividends using Yahoo's adj_close ratio.
     Backtests need this, or a 1:2 split looks like a 50% crash."""

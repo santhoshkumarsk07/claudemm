@@ -58,19 +58,57 @@ class PaperAccount:
         self._put("mode", mode)
         self.save()
 
-    def process_day(self, date: pd.Timestamp, bars: dict[str, pd.Series]) -> list[str]:
-        """Fill queued orders at this session's open, run stops/targets, mark to the close."""
-        n_tr, n_or = len(self.sim.trades), len(self.sim.orders)
-        ev = self.sim.step(date, bars)
-        d = date.strftime("%Y-%m-%d")
+    def _record(self, n_tr: int, n_or: int, lines: list[str]) -> None:
+        """Persist trades/orders created since (n_tr, n_or) plus log lines, then save state."""
         self.conn.executemany("INSERT INTO trades(json) VALUES (?)", [(json.dumps(t),) for t in self.sim.trades[n_tr:]])
         self.conn.executemany("INSERT INTO orders(json) VALUES (?)", [(json.dumps(o),) for o in self.sim.orders[n_or:]])
+        if lines:
+            self.log(*lines)
+        self.save()
+
+    def process_day(self, date: pd.Timestamp, bars: dict[str, pd.Series]) -> list[str]:
+        """Daily-bar path: fill queued orders at this session's open, stops/targets, mark to the close."""
+        n_tr, n_or = len(self.sim.trades), len(self.sim.orders)
+        ev = self.sim.step(date, bars)
+        self._end_of_day(date)
+        self._record(n_tr, n_or, [f"{date.strftime('%Y-%m-%d')} {e}" for e in ev])
+        return ev
+
+    def _end_of_day(self, date: pd.Timestamp) -> None:
+        d = date.strftime("%Y-%m-%d")
         self.conn.execute("INSERT OR REPLACE INTO equity VALUES (?,?,?,?)",
                           (d, round(self.sim.total_equity, 2), round(self.sim.cash, 2), round(self.sim.holdings, 2)))
-        self.log(*[f"{d} {e}" for e in ev])
         self.last_date = d
-        self.save()
+
+    # ---- live-session path (quant/live.py) ------------------------------
+    def live_fill(self, sym: str, ts: pd.Timestamp, price: float, note: str = "") -> str | None:
+        n_tr, n_or = len(self.sim.trades), len(self.sim.orders)
+        msg = self.sim.fill_pending(sym, ts, price)
+        if msg:
+            self._record(n_tr, n_or, [f"{ts:%Y-%m-%d %H:%M} LIVE {msg}{note}"])
+        return msg
+
+    def live_check(self, sym: str, ts: pd.Timestamp, o: float, h: float, l: float) -> str | None:
+        n_tr, n_or = len(self.sim.trades), len(self.sim.orders)
+        msg = self.sim.check_bar(sym, ts, o, h, l)
+        if msg:
+            self._record(n_tr, n_or, [f"{ts:%Y-%m-%d %H:%M} LIVE {msg}"])
+        return msg
+
+    def live_close(self, date: pd.Timestamp, closes: dict[str, float]) -> list[str]:
+        """End of a live session: mark to the last prices, record equity, mark the day as processed."""
+        ev = self.sim.close_session(date, closes)
+        self._end_of_day(date)
+        self._record(len(self.sim.trades), len(self.sim.orders), [f"{date:%Y-%m-%d} LIVE session closed: {e}" for e in ev]
+                     or [f"{date:%Y-%m-%d} LIVE session closed. Equity Rs {self.sim.total_equity:,.2f}"])
         return ev
+
+    def set_live_status(self, status: dict) -> None:
+        self._put("live_status", status)
+        self.conn.commit()
+
+    def live_status(self) -> dict | None:
+        return self._get("live_status")
 
     def queue(self, symbol: str, side: str, reason: str, atr: float | None, signal_date) -> None:
         self.sim.order(symbol, side, reason, atr, signal_date)
